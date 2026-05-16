@@ -173,13 +173,29 @@ function wordWrap(text: string, width: number): string[] {
   return result;
 }
 
+// ─── Box drawing ─────────────────────────────────────────────────────────────
+
+// Wraps an array of content lines (each already sized to outerWidth-2 visible
+// chars) in a Unicode box. ANSI codes are stripped only for padding measurement.
+function box(content: string[], outerWidth: number): string[] {
+  const cw = outerWidth - 2; // inner width between the │ chars
+  const out: string[] = [A_DIM + "┌" + "─".repeat(cw) + "┐" + A_RESET];
+  for (const line of content) {
+    const vis = line.replace(/\x1b\[[0-9;]*m/g, "").length;
+    out.push(A_DIM + "│" + A_RESET + line + " ".repeat(Math.max(0, cw - vis)) + A_DIM + "│" + A_RESET);
+  }
+  out.push(A_DIM + "└" + "─".repeat(cw) + "┘" + A_RESET);
+  return out;
+}
+
 // ─── Diff rendering ───────────────────────────────────────────────────────────
 
 function colorDiffLine(raw: string, width: number): string {
   const clipped = raw.length > width ? raw.slice(0, width - 1) + "…" : raw;
-  if (raw.startsWith("@@")) return A_CYAN + A_DIM + clipped + A_RESET;
-  if (raw.startsWith("+"))  return A_GREEN + clipped + A_RESET;
-  if (raw.startsWith("-"))  return A_RED   + clipped + A_RESET;
+  if (raw.startsWith("@@"))                    return A_CYAN + A_DIM + clipped + A_RESET;
+  if (raw.startsWith("---") || raw.startsWith("+++")) return A_BOLD + A_DIM + clipped + A_RESET;
+  if (raw.startsWith("+"))                     return A_GREEN + clipped + A_RESET;
+  if (raw.startsWith("-"))                     return A_RED   + clipped + A_RESET;
   return A_DIM + clipped + A_RESET;
 }
 
@@ -331,50 +347,98 @@ function groupThreads(comments: PRComment[]): Thread[] {
   return threads;
 }
 
-// ─── Agent message builder ────────────────────────────────────────────────────
+// ─── Agent message builders ───────────────────────────────────────────────────
 
-function buildAgentMessage(thread: Thread, prNumber: number): string {
-  const { root, replies } = thread;
-  const line = root.line ?? root.original_line;
-  const location = line ? `${root.path} (line ${line})` : root.path;
+function buildAgentMessage(
+  selectedThreads: Thread[],
+  prNumber: number,
+  feedback?: string
+): string {
+  const parts: string[] = [];
 
-  const quotedRoot = root.body
-    .split("\n")
-    .map((l) => `> ${l}`)
-    .join("\n");
+  if (selectedThreads.length === 1) {
+    const { root, replies } = selectedThreads[0];
+    const line = root.line ?? root.original_line;
+    const location = line ? `${root.path} (line ${line})` : root.path;
 
-  const quotedReplies = replies
-    .map((r) => {
-      const body = r.body
-        .split("\n")
-        .map((l) => `> ${l}`)
-        .join("\n");
-      return `>\n> Reply from @${r.user.login}:\n${body}`;
-    })
-    .join("\n");
+    const quotedRoot = root.body.split("\n").map((l) => `> ${l}`).join("\n");
+    const quotedReplies = replies
+      .map((r) => {
+        const body = r.body.split("\n").map((l) => `> ${l}`).join("\n");
+        return `>\n> Reply from @${r.user.login}:\n${body}`;
+      })
+      .join("\n");
 
-  return [
-    `Address this PR #${prNumber} review comment:`,
-    ``,
-    `File: ${location}`,
-    `Author: @${root.user.login}`,
-    ``,
-    quotedRoot,
-    quotedReplies,
-    ``,
-    `Please make the necessary code changes to address this feedback.`,
-  ]
-    .join("\n")
-    .trim();
+    parts.push(
+      `Address this PR #${prNumber} review comment:`,
+      ``,
+      `File: ${location}`,
+      `Author: @${root.user.login}`,
+      ``,
+      quotedRoot,
+      quotedReplies,
+      ``,
+      `Please make the necessary code changes directly to the file(s) to address this feedback.`
+    );
+  } else {
+    parts.push(
+      `Address these ${selectedThreads.length} PR #${prNumber} review comments together:`,
+      ``
+    );
+    for (let i = 0; i < selectedThreads.length; i++) {
+      const { root, replies } = selectedThreads[i];
+      const line = root.line ?? root.original_line;
+      const location = line ? `${root.path} (line ${line})` : root.path;
+      parts.push(
+        `─── Comment ${i + 1} of ${selectedThreads.length} ───`,
+        `File: ${location}`,
+        `Author: @${root.user.login}`,
+        ``,
+        ...root.body.split("\n").map((l) => `> ${l}`)
+      );
+      for (const r of replies) {
+        parts.push(`>`, `> Reply from @${r.user.login}:`);
+        parts.push(...r.body.split("\n").map((l) => `> ${l}`));
+      }
+      parts.push(``);
+    }
+    parts.push(`Please make all the necessary code changes to address every comment above.`);
+  }
+
+  if (feedback) {
+    parts.push(
+      ``,
+      `Previous attempt was rejected. Reviewer feedback:`,
+      ``,
+      `  ${feedback}`,
+      ``,
+      `Please revise your approach accordingly.`
+    );
+  }
+
+  return parts.join("\n").trim();
+}
+
+function buildCommitMessage(selectedThreads: Thread[], prNumber: number): string {
+  if (selectedThreads.length === 1) {
+    const { root } = selectedThreads[0];
+    const line = root.line ?? root.original_line;
+    const loc  = line ? `${root.path}:${line}` : root.path;
+    const summary = root.body.split("\n")[0].replace(/`/g, "'").slice(0, 72);
+    return `Fix PR #${prNumber} review: ${summary}\n\nFile: ${loc}\nReviewer: @${root.user.login}`;
+  }
+  const files    = [...new Set(selectedThreads.map((t) => t.root.path))].join(", ");
+  const authors  = [...new Set(selectedThreads.map((t) => `@${t.root.user.login}`))].join(", ");
+  return `Fix ${selectedThreads.length} PR #${prNumber} review comments\n\nFiles: ${files}\nReviewers: ${authors}`;
 }
 
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
-  pi.registerCommand("pr-comments", {
+  pi.registerCommand("pr", {
     description:
       "Browse GitHub PR review comment threads and pick one for Pi to address.\n" +
-      "  /pr-comments",
+      "  /pr",
 
     handler: async (_args, ctx) => {
       // Aliases for the module-level ANSI constants (shorter names inside handler)
@@ -414,16 +478,16 @@ export default function (pi: ExtensionAPI) {
       }
 
       // ── 3. Fetch open PRs ───────────────────────────────────────────────────
-      ctx.ui.setStatus("pr-comments", "Fetching open PRs…");
+      ctx.ui.setStatus("pr", "Fetching open PRs…");
       let prs: PR[];
       try {
         prs = shellJSON<PR[]>("gh pr list --json number,title,headRefName");
       } catch (err: any) {
-        ctx.ui.setStatus("pr-comments", "");
+        ctx.ui.setStatus("pr", "");
         ctx.ui.notify(`gh pr list failed: ${err.message}`, "error");
         return;
       }
-      ctx.ui.setStatus("pr-comments", "");
+      ctx.ui.setStatus("pr", "");
 
       if (prs.length === 0) {
         ctx.ui.notify("No open PRs found", "info");
@@ -447,11 +511,12 @@ export default function (pi: ExtensionAPI) {
 
           return {
             render(width: number): string[] {
-              const lines: string[] = [];
-              const innerW = width - 2;
+              const cw = width - 2;
+              const innerW = cw - 2;
+              const content: string[] = [];
 
-              lines.push(BOLD + truncate(` Select PR — ${repoSlug}`, width) + RESET);
-              lines.push(DIM + "─".repeat(width) + RESET);
+              content.push(BOLD + truncate(` Select PR — ${repoSlug}`, cw) + RESET);
+              content.push(DIM + "─".repeat(cw) + RESET);
 
               const end = Math.min(scroll + MAX_PR_VISIBLE, prs.length);
               for (let i = scroll; i < end; i++) {
@@ -459,19 +524,19 @@ export default function (pi: ExtensionAPI) {
                 const row = `#${pr.number}  ${pr.title}  (${pr.headRefName})`;
                 const cell = truncate(row, innerW);
                 if (i === cursor) {
-                  lines.push(" " + INVERT + pad(cell, innerW) + RESET + " ");
+                  content.push(" " + INVERT + pad(cell, innerW) + RESET + " ");
                 } else {
-                  lines.push(" " + pad(cell, innerW) + " ");
+                  content.push(" " + pad(cell, innerW) + " ");
                 }
               }
 
-              lines.push(DIM + "─".repeat(width) + RESET);
+              content.push(DIM + "─".repeat(cw) + RESET);
               const hint = " ↑↓ navigate · Enter select · Esc cancel ";
               const info = ` ${cursor + 1}/${prs.length} `;
-              const gap = width - hint.length - info.length;
-              lines.push(DIM + hint + " ".repeat(Math.max(0, gap)) + info + RESET);
+              const gap = cw - hint.length - info.length;
+              content.push(DIM + hint + " ".repeat(Math.max(0, gap)) + info + RESET);
 
-              return lines;
+              return box(content, width);
             },
 
             handleInput(data: string) {
@@ -500,7 +565,7 @@ export default function (pi: ExtensionAPI) {
       const pr = prs[pickedPRIdx];
 
       // ── 5. Fetch PR review comments (with HTML bodies) ──────────────────────
-      ctx.ui.setStatus("pr-comments", `Fetching comments for PR #${pr.number}…`);
+      ctx.ui.setStatus("pr", `Fetching comments for PR #${pr.number}…`);
       let rawComments: PRComment[];
       try {
         rawComments = shellJSON<PRComment[]>(
@@ -508,11 +573,11 @@ export default function (pi: ExtensionAPI) {
           `"/repos/${repoSlug}/pulls/${pr.number}/comments?per_page=100"`
         );
       } catch (err: any) {
-        ctx.ui.setStatus("pr-comments", "");
+        ctx.ui.setStatus("pr", "");
         ctx.ui.notify(`gh API error: ${err.message}`, "error");
         return;
       }
-      ctx.ui.setStatus("pr-comments", "");
+      ctx.ui.setStatus("pr", "");
 
       if (rawComments.length === 0) {
         ctx.ui.notify(`PR #${pr.number} has no review comments`, "info");
@@ -527,34 +592,49 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      // ── 7. Screen 2 — Comment Navigator ────────────────────────────────────
-      //   ← / → : cycle threads          (resets scroll)
-      //   ↑ / ↓ : scroll body text
-      //   Enter  : address selected thread
-      //   Esc    : back to PR picker
+      // ── 7. Comment Navigator loop ───────────────────────────────────────────
+      //   Re-opens the navigator after each fix so the user can pick the next
+      //   comment to address. Esc in the navigator exits the loop entirely.
 
       const BODY_VISIBLE = 22;
 
-      const pickedThreadIdx = await ctx.ui.custom<number | null>(
+      // Threads dismissed with x — persists across commentLoop iterations
+      const dismissedIds = new Set<number>();
+
+      commentLoop: while (true) {
+
+      // Recompute visible list each time the navigator opens
+      let visibleThreads: Thread[] = [];
+
+      // null = Esc (exit), number[] = indices into visibleThreads to fix
+      const pickedIndices = await ctx.ui.custom<number[] | null>(
         (tui, _theme, _kb, done) => {
+          visibleThreads = threads.filter((t) => !dismissedIds.has(t.root.id));
+
+          if (visibleThreads.length === 0) {
+            done(null);
+            return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+          }
+
           let threadIdx = 0;
           let scrollY   = 0;
-          // Cache rendered body lines per thread index (width-dependent; reset on resize)
+          const markedIndices = new Set<number>();
+
           let cachedWidth = -1;
           let cachedLines: string[] = [];
 
           function getBodyLines(width: number): string[] {
             if (width !== cachedWidth) {
               cachedWidth = width;
-              cachedLines = threadBodyLines(threads[threadIdx], width - 2);
+              cachedLines = threadBodyLines(visibleThreads[threadIdx], width - 2);
             }
             return cachedLines;
           }
 
           function goToThread(idx: number) {
-            threadIdx = Math.max(0, Math.min(threads.length - 1, idx));
+            threadIdx = Math.max(0, Math.min(visibleThreads.length - 1, idx));
             scrollY   = 0;
-            cachedWidth = -1; // invalidate cache
+            cachedWidth = -1;
           }
 
           function clampScroll(bodyLen: number) {
@@ -565,29 +645,35 @@ export default function (pi: ExtensionAPI) {
 
           return {
             render(width: number): string[] {
-              const lines: string[] = [];
-              const innerW = width - 2;
-              const t = threads[threadIdx];
+              const cw = width - 2;
+              const content: string[] = [];
+              const t = visibleThreads[threadIdx];
               const tLine = t.root.line ?? t.root.original_line ?? "?";
+              const isMarked = markedIndices.has(threadIdx);
               const replyBadge = t.replies.length
                 ? `  [+${t.replies.length} repl${t.replies.length === 1 ? "y" : "ies"}]`
                 : "";
 
               // ── Header ──
-              const threadPos = `[${threadIdx + 1} / ${threads.length}]`;
-              const titleLeft = ` PR #${pr.number} Review Comments`;
-              const titleGap  = width - titleLeft.length - threadPos.length - 1;
-              lines.push(
-                BOLD + titleLeft + " ".repeat(Math.max(1, titleGap)) + threadPos + RESET
+              const markedBadge = markedIndices.size > 0
+                ? ` [${markedIndices.size} marked]` : "";
+              const markFlag  = isMarked ? " ★" : "  ";
+              const threadPos = `${markFlag} ${threadIdx + 1} / ${visibleThreads.length} `;
+              const titleLeft = ` PR #${pr.number} Review Comments${markedBadge}`;
+              const titleGap  = cw - titleLeft.length - threadPos.length;
+              content.push(
+                BOLD + titleLeft +
+                " ".repeat(Math.max(0, titleGap)) +
+                (isMarked ? A_GREEN : DIM) + threadPos + RESET
               );
 
               // ── Location + author ──
-              lines.push(
+              content.push(
                 DIM +
-                  truncate(` ${t.root.path}:${tLine}  @${t.root.user.login}${replyBadge}`, width) +
+                  truncate(` ${t.root.path}:${tLine}  @${t.root.user.login}${replyBadge}`, cw) +
                   RESET
               );
-              lines.push(DIM + "─".repeat(width) + RESET);
+              content.push(DIM + "─".repeat(cw) + RESET);
 
               // ── Body (scrollable) ──
               const bodyLines = getBodyLines(width);
@@ -595,57 +681,69 @@ export default function (pi: ExtensionAPI) {
 
               const visibleEnd = Math.min(scrollY + BODY_VISIBLE, bodyLines.length);
               for (let i = scrollY; i < visibleEnd; i++) {
-                lines.push(" " + bodyLines[i]);
+                content.push(" " + bodyLines[i]);
               }
-              // Pad to BODY_VISIBLE rows so the footer doesn't jump
               for (let i = visibleEnd - scrollY; i < BODY_VISIBLE; i++) {
-                lines.push("");
+                content.push("");
               }
 
-              // ── Scroll indicator + footer ──
-              lines.push(DIM + "─".repeat(width) + RESET);
-
-              const hint = " ← → switch · ↑↓ scroll · Enter address · Esc back ";
+              // ── Footer ──
+              content.push(DIM + "─".repeat(cw) + RESET);
+              const hint = " ← → switch · ↑↓ scroll · m mark · x dismiss · Enter fix · Esc exit ";
               const scrollInfo = bodyLines.length > BODY_VISIBLE
                 ? ` ${scrollY + 1}–${Math.min(scrollY + BODY_VISIBLE, bodyLines.length)}/${bodyLines.length} `
                 : "";
-              const fgap = width - hint.length - scrollInfo.length;
-              lines.push(DIM + hint + " ".repeat(Math.max(0, fgap)) + scrollInfo + RESET);
+              const fgap = cw - hint.length - scrollInfo.length;
+              content.push(DIM + hint + " ".repeat(Math.max(0, fgap)) + scrollInfo + RESET);
 
-              return lines;
+              return box(content, width);
             },
 
             handleInput(data: string) {
               const bodyLines = getBodyLines(cachedWidth > 0 ? cachedWidth : 80);
 
               if (data === "\x1b[D" || data === "h") {
-                // Left — previous thread
                 goToThread(threadIdx - 1);
               } else if (data === "\x1b[C" || data === "l") {
-                // Right — next thread
                 goToThread(threadIdx + 1);
               } else if (data === "\x1b[A" || data === "k") {
-                // Up — scroll body up
-                scrollY--;
-                clampScroll(bodyLines.length);
+                scrollY--; clampScroll(bodyLines.length);
               } else if (data === "\x1b[B" || data === "j") {
-                // Down — scroll body down
-                scrollY++;
-                clampScroll(bodyLines.length);
+                scrollY++; clampScroll(bodyLines.length);
               } else if (data === "\x1b[5~") {
-                // PgUp
-                scrollY -= BODY_VISIBLE;
-                clampScroll(bodyLines.length);
+                scrollY -= BODY_VISIBLE; clampScroll(bodyLines.length);
               } else if (data === "\x1b[6~") {
-                // PgDn
-                scrollY += BODY_VISIBLE;
-                clampScroll(bodyLines.length);
+                scrollY += BODY_VISIBLE; clampScroll(bodyLines.length);
               } else if (data === "\x1b[H") {
                 scrollY = 0;
               } else if (data === "\x1b[F") {
                 scrollY = Math.max(0, bodyLines.length - BODY_VISIBLE);
+              } else if (data === "m") {
+                if (markedIndices.has(threadIdx)) {
+                  markedIndices.delete(threadIdx);
+                } else {
+                  markedIndices.add(threadIdx);
+                }
+              } else if (data === "x") {
+                // Dismiss current thread — remove from markedIndices, remap
+                // indices above the dismissed slot down by one, then rebuild list
+                dismissedIds.add(visibleThreads[threadIdx].root.id);
+                const newMarked = new Set<number>();
+                for (const idx of markedIndices) {
+                  if (idx < threadIdx) newMarked.add(idx);
+                  else if (idx > threadIdx) newMarked.add(idx - 1);
+                }
+                markedIndices.clear();
+                for (const idx of newMarked) markedIndices.add(idx);
+                visibleThreads = threads.filter((t) => !dismissedIds.has(t.root.id));
+                if (visibleThreads.length === 0) { done(null); return; }
+                threadIdx = Math.min(threadIdx, visibleThreads.length - 1);
+                cachedWidth = -1;
               } else if (data === "\r" || data === "\n") {
-                done(threadIdx);
+                const toFix = markedIndices.size > 0
+                  ? Array.from(markedIndices).sort((a, b) => a - b)
+                  : [threadIdx];
+                done(toFix);
                 return;
               } else if (data === "\x1b") {
                 done(null);
@@ -656,24 +754,181 @@ export default function (pi: ExtensionAPI) {
             },
 
             invalidate() {
-              cachedWidth = -1; // force re-wrap on terminal resize
+              cachedWidth = -1;
             },
           };
         },
         { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
       );
 
-      if (pickedThreadIdx === null) {
-        ctx.ui.notify("Cancelled.", "info");
-        return;
+      if (pickedIndices === null) {
+        if (visibleThreads.length === 0) {
+          ctx.ui.notify("All comment threads dismissed.", "info");
+        }
+        break commentLoop;
       }
 
-      const thread = threads[pickedThreadIdx];
-      if (!thread) return;
+      const selectedThreads = pickedIndices.map((i) => visibleThreads[i]).filter(Boolean);
+      if (selectedThreads.length === 0) continue commentLoop;
 
-      // ── 8. Inject thread as agent user message ──────────────────────────────
-      await ctx.waitForIdle();
-      pi.sendUserMessage(buildAgentMessage(thread, pr.number));
+      // ── 8. Iterative fix loop ────────────────────────────────────────────────
+      //   Pi proposes changes → diff shown for review → user accepts or rejects.
+      //   On rejection the user types feedback; Pi retries with that context.
+      //   On acceptance the diff is committed. Esc at any point exits cleanly.
+      //
+      //   Synchronisation: a 2 s delay before waitForIdle() lets Pi transition
+      //   to "busy" before we check; a 30 s safety poll after covers cases where
+      //   waitForIdle() resolves marginally before Pi's last file write lands.
+
+      const PATCH_VISIBLE = 30;
+      let feedback: string | undefined;
+
+      fixLoop: while (true) {
+        // Snapshot HEAD so we can diff correctly even if Pi commits
+        let baseSha = "";
+        try { baseSha = shell("git rev-parse HEAD").trim(); } catch {}
+
+        // ── 8a. Ask Pi to make changes ────────────────────────────────────────
+        await ctx.waitForIdle();
+        ctx.ui.setStatus("pr", feedback ? "Pi is revising the fix…" : "Pi is generating a fix…");
+
+        // Promisified agent_end: bridge the event emitter into async/await so
+        // we block here until Pi's turn completes with no polling or fixed delays.
+        await new Promise<void>((resolve) => {
+          let settled = false;
+          pi.on("agent_end", () => { if (!settled) { settled = true; resolve(); } });
+          pi.sendUserMessage(buildAgentMessage(selectedThreads, pr.number, feedback));
+        });
+
+        ctx.ui.setStatus("pr", "");
+
+        // ── 8b. Capture proposed diff ─────────────────────────────────────────
+        let currentSha = "";
+        let rawDiff = "";
+        try {
+          currentSha = shell("git rev-parse HEAD").trim();
+          const cmd = currentSha !== baseSha
+            ? `git diff ${baseSha}..${currentSha} --unified=5`
+            : "git diff HEAD --unified=5";
+          rawDiff = shell(cmd);
+        } catch { /* ignore */ }
+
+        const piCommitted = !!baseSha && !!currentSha && currentSha !== baseSha;
+
+        if (!rawDiff.trim()) {
+          ctx.ui.notify("Pi made no changes.", "info");
+          break fixLoop;
+        }
+        const patchLines = rawDiff.split("\n");
+
+        // ── 8c. Screen 3 — Diff Review ───────────────────────────────────────
+        //   y / Enter : commit (or keep if Pi already committed)
+        //   n         : reject → prompt for feedback → retry
+        //   Esc       : cancel → revert and exit
+
+        const decision = await ctx.ui.custom<"commit" | "reject" | "cancel">(
+          (tui, _theme, _kb, done) => {
+            let scrollY = 0;
+
+            function clampScroll() {
+              const max = Math.max(0, patchLines.length - PATCH_VISIBLE);
+              if (scrollY < 0) scrollY = 0;
+              if (scrollY > max) scrollY = max;
+            }
+
+            return {
+              render(width: number): string[] {
+                const cw = width - 2;
+                const innerW = cw - 1;
+                const content: string[] = [];
+
+                const pos = patchLines.length > PATCH_VISIBLE
+                  ? ` [${scrollY + 1}–${Math.min(scrollY + PATCH_VISIBLE, patchLines.length)}/${patchLines.length}]`
+                  : "";
+                const titleLeft = ` Proposed Fix — PR #${pr.number}`;
+                const titleGap  = cw - titleLeft.length - pos.length;
+                content.push(BOLD + titleLeft + " ".repeat(Math.max(0, titleGap)) + pos + RESET);
+                content.push(DIM + "─".repeat(cw) + RESET);
+
+                const end = Math.min(scrollY + PATCH_VISIBLE, patchLines.length);
+                for (let i = scrollY; i < end; i++) {
+                  content.push(" " + colorDiffLine(patchLines[i], innerW));
+                }
+                for (let i = end - scrollY; i < PATCH_VISIBLE; i++) {
+                  content.push("");
+                }
+
+                content.push(DIM + "─".repeat(cw) + RESET);
+                const hint = " y commit · n reject & retry · Esc cancel ";
+                const scrollInfo = patchLines.length > PATCH_VISIBLE ? " ↑↓ scroll " : "";
+                const fgap = cw - hint.length - scrollInfo.length;
+                content.push(DIM + hint + " ".repeat(Math.max(0, fgap)) + scrollInfo + RESET);
+
+                return box(content, width);
+              },
+
+              handleInput(data: string) {
+                if      (data === "\x1b[A" || data === "k") { scrollY--; clampScroll(); }
+                else if (data === "\x1b[B" || data === "j") { scrollY++; clampScroll(); }
+                else if (data === "\x1b[5~") { scrollY -= PATCH_VISIBLE; clampScroll(); }
+                else if (data === "\x1b[6~") { scrollY += PATCH_VISIBLE; clampScroll(); }
+                else if (data === "\x1b[H")  { scrollY = 0; }
+                else if (data === "\x1b[F")  { scrollY = Math.max(0, patchLines.length - PATCH_VISIBLE); }
+                else if (data === "y")         { done("commit"); return; }
+                else if (data === "n")         { done("reject"); return; }
+                else if (data === "\r" || data === "\n") { /* ignore Enter to prevent leaking from previous screen */ }
+                else if (data === "\x1b")      { done("cancel"); return; }
+                tui.requestRender();
+              },
+
+              invalidate() {},
+            };
+          },
+          { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
+        );
+
+        if (decision === "commit") {
+          try {
+            if (!piCommitted) {
+              shell("git add -A");
+              shell(`git commit -m ${JSON.stringify(buildCommitMessage(selectedThreads, pr.number))}`);
+            }
+            ctx.ui.notify(`Fix committed — PR #${pr.number}.`, "info");
+          } catch (err: any) {
+            ctx.ui.notify(`Commit failed: ${err.message}`, "error");
+          }
+          break fixLoop;
+        }
+
+        // Revert Pi's changes before retrying or exiting
+        try {
+          if (piCommitted) {
+            shell(`git reset --hard ${JSON.stringify(baseSha)}`);
+          } else {
+            shell("git restore --staged --worktree .");
+          }
+        } catch {
+          try { shell("git checkout -- ."); } catch { /* best-effort */ }
+        }
+
+        if (decision === "cancel") {
+          ctx.ui.notify("Cancelled — changes reverted.", "info");
+          break fixLoop;
+        }
+
+        // Rejected: collect feedback and loop
+        const fb = await ctx.ui.input(
+          "What was wrong with that fix?",
+          "Describe the issue so Pi can try again…"
+        );
+        if (!fb) {
+          ctx.ui.notify("No feedback provided — exiting.", "info");
+          break fixLoop;
+        }
+        feedback = fb;
+      }
+
+      } // end commentLoop
     },
   });
 }
