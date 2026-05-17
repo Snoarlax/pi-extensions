@@ -435,12 +435,4 @@ export default function (pi: ExtensionAPI) {
       pi.sendUserMessage(buildFixPrompt(selected));
     },
   });
-
-  // Ctrl+I shortcut to open the issue browser quickly
-  pi.registerShortcut("ctrl+i", {
-    description: "Open GitHub issue browser (/issues)",
-    handler: async (_ctx) => {
-      pi.sendUserMessage("/issues", { deliverAs: "followUp" });
-    },
-  });
 }

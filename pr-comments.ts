@@ -17,6 +17,8 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
+import { existsSync, readFileSync } from "node:fs";
+import { join } from "node:path";
 
 // ─── ANSI constants (module-level so helpers can use them) ────────────────────
 
@@ -173,19 +175,55 @@ function wordWrap(text: string, width: number): string[] {
   return result;
 }
 
-// ─── Box drawing ─────────────────────────────────────────────────────────────
+// ─── ZellijModal-style frame ──────────────────────────────────────────────────
+// Rounded borders with title/footer embedded in the border lines, matching the
+// visual style of pi-tool-display's ZellijModal component.
 
-// Wraps an array of content lines (each already sized to outerWidth-2 visible
-// chars) in a Unicode box. ANSI codes are stripped only for padding measurement.
-function box(content: string[], outerWidth: number): string[] {
-  const cw = outerWidth - 2; // inner width between the │ chars
-  const out: string[] = [A_DIM + "┌" + "─".repeat(cw) + "┐" + A_RESET];
+const ZB = { tl: "╭", tr: "╮", bl: "╰", br: "╯", h: "─", v: "│" };
+
+function zellijFrame(
+  content: string[],
+  outerWidth: number,
+  title?: { left?: string; right?: string },
+  footer?: { left?: string; right?: string }
+): string[] {
+  const cw  = outerWidth - 2;
+
+  const tl = title?.left   ?? "";
+  const tr = title?.right  ?? "";
+  const fl = footer?.left  ?? "";
+  const fr = footer?.right ?? "";
+
+  const topFill = Math.max(0, cw - visLen(tl) - visLen(tr));
+  const botFill = Math.max(0, cw - visLen(fl) - visLen(fr));
+
+  const out: string[] = [
+    A_DIM + ZB.tl + A_RESET + tl + A_DIM + ZB.h.repeat(topFill) + A_RESET + tr + A_DIM + ZB.tr + A_RESET,
+  ];
   for (const line of content) {
-    const vis = line.replace(/\x1b\[[0-9;]*m/g, "").length;
-    out.push(A_DIM + "│" + A_RESET + line + " ".repeat(Math.max(0, cw - vis)) + A_DIM + "│" + A_RESET);
+    const fill = Math.max(0, cw - visLen(line));
+    out.push(A_DIM + ZB.v + A_RESET + line + " ".repeat(fill) + A_DIM + ZB.v + A_RESET);
   }
-  out.push(A_DIM + "└" + "─".repeat(cw) + "┘" + A_RESET);
+  out.push(
+    A_DIM + ZB.bl + A_RESET + fl + A_DIM + ZB.h.repeat(botFill) + A_RESET + fr + A_DIM + ZB.br + A_RESET
+  );
   return out;
+}
+
+// ─── String helpers ──────────────────────────────────────────────────────────
+
+function visLen(s: string): number {
+  return s.replace(/\x1b\[[0-9;]*m/g, "").length;
+}
+
+function truncate(s: string, max: number): string {
+  const visible = s.replace(/\x1b\[[0-9;]*m/g, "");
+  if (visible.length <= max) return s;
+  return visible.slice(0, max - 1) + "…";
+}
+
+function pad(s: string, width: number): string {
+  return s + " ".repeat(Math.max(0, width - visLen(s)));
 }
 
 // ─── Diff rendering ───────────────────────────────────────────────────────────
@@ -432,6 +470,74 @@ function buildCommitMessage(selectedThreads: Thread[], prNumber: number): string
   return `Fix ${selectedThreads.length} PR #${prNumber} review comments\n\nFiles: ${files}\nReviewers: ${authors}`;
 }
 
+// ─── TODO file support ────────────────────────────────────────────────────────
+
+let _todoIdCounter = 0x80000000;
+
+function parseTodoFile(content: string, relPath: string): Thread[] {
+  const threads: Thread[] = [];
+  const lines = content.split("\n");
+
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i].trim();
+    if (!text) continue;
+    threads.push({
+      root: { id: _todoIdCounter++, body: text, path: relPath, line: i + 1, user: { login: "TODO" } },
+      replies: [],
+    });
+  }
+
+  return threads;
+}
+
+function buildTodoAgentMessage(selectedThreads: Thread[], feedback?: string): string {
+  const parts: string[] = [];
+
+  if (selectedThreads.length === 1) {
+    const { root } = selectedThreads[0];
+    parts.push(
+      `Complete this TODO item from \`${root.path}\` (line ${root.line ?? "?"}):`,
+      ``,
+      `> ${root.body}`,
+      ``,
+      `Please implement the necessary code changes to complete this task. Do not modify the TODO file.`
+    );
+  } else {
+    parts.push(`Complete these ${selectedThreads.length} TODO items:`, ``);
+    for (let i = 0; i < selectedThreads.length; i++) {
+      const { root } = selectedThreads[i];
+      parts.push(
+        `─── Item ${i + 1} of ${selectedThreads.length} (${root.path}:${root.line ?? "?"}) ───`,
+        ``,
+        `> ${root.body}`,
+        ``
+      );
+    }
+    parts.push(`Please implement all the necessary code changes to complete every item above. Do not modify the TODO file.`);
+  }
+
+  if (feedback) {
+    parts.push(
+      ``,
+      `Previous attempt was rejected. Reviewer feedback:`,
+      ``,
+      `  ${feedback}`,
+      ``,
+      `Please revise your approach accordingly.`
+    );
+  }
+
+  return parts.join("\n").trim();
+}
+
+function buildTodoCommitMessage(selectedThreads: Thread[]): string {
+  if (selectedThreads.length === 1) {
+    const summary = selectedThreads[0].root.body.split("\n")[0].replace(/`/g, "'").slice(0, 72);
+    return `Complete TODO: ${summary}`;
+  }
+  return `Complete ${selectedThreads.length} TODO items`;
+}
+
 // ─── Extension ────────────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -446,17 +552,6 @@ export default function (pi: ExtensionAPI) {
       const BOLD   = A_BOLD;
       const DIM    = A_DIM;
       const INVERT = A_INVERT;
-
-      function truncate(s: string, max: number): string {
-        const visible = s.replace(/\x1b\[[0-9;]*m/g, "");
-        if (visible.length <= max) return s;
-        return visible.slice(0, max - 1) + "…";
-      }
-
-      function pad(s: string, width: number): string {
-        const visible = s.replace(/\x1b\[[0-9;]*m/g, "");
-        return s + " ".repeat(Math.max(0, width - visible.length));
-      }
 
       // ── 1. Verify gh CLI ────────────────────────────────────────────────────
       try {
@@ -511,16 +606,13 @@ export default function (pi: ExtensionAPI) {
 
           return {
             render(width: number): string[] {
-              const cw = width - 2;
-              const innerW = cw - 2;
+              const cw     = width - 2;
+              const innerW = cw - 2; // 1-char margin each side
               const content: string[] = [];
-
-              content.push(BOLD + truncate(` Select PR — ${repoSlug}`, cw) + RESET);
-              content.push(DIM + "─".repeat(cw) + RESET);
 
               const end = Math.min(scroll + MAX_PR_VISIBLE, prs.length);
               for (let i = scroll; i < end; i++) {
-                const pr = prs[i];
+                const pr  = prs[i];
                 const row = `#${pr.number}  ${pr.title}  (${pr.headRefName})`;
                 const cell = truncate(row, innerW);
                 if (i === cursor) {
@@ -530,13 +622,14 @@ export default function (pi: ExtensionAPI) {
                 }
               }
 
-              content.push(DIM + "─".repeat(cw) + RESET);
-              const hint = " ↑↓ navigate · Enter select · Esc cancel ";
+              const hint = ` ↑↓ navigate · Enter select · Esc cancel `;
               const info = ` ${cursor + 1}/${prs.length} `;
-              const gap = cw - hint.length - info.length;
-              content.push(DIM + hint + " ".repeat(Math.max(0, gap)) + info + RESET);
 
-              return box(content, width);
+              return zellijFrame(
+                content, width,
+                { left: BOLD + ` Select PR — ${repoSlug} ` + RESET },
+                { left: DIM + hint + RESET, right: DIM + info + RESET }
+              );
             },
 
             handleInput(data: string) {
@@ -654,26 +747,11 @@ export default function (pi: ExtensionAPI) {
                 ? `  [+${t.replies.length} repl${t.replies.length === 1 ? "y" : "ies"}]`
                 : "";
 
-              // ── Header ──
-              const markedBadge = markedIndices.size > 0
-                ? ` [${markedIndices.size} marked]` : "";
-              const markFlag  = isMarked ? " ★" : "  ";
-              const threadPos = `${markFlag} ${threadIdx + 1} / ${visibleThreads.length} `;
-              const titleLeft = ` PR #${pr.number} Review Comments${markedBadge}`;
-              const titleGap  = cw - titleLeft.length - threadPos.length;
+              // ── Location + author (first content line) ──
               content.push(
-                BOLD + titleLeft +
-                " ".repeat(Math.max(0, titleGap)) +
-                (isMarked ? A_GREEN : DIM) + threadPos + RESET
+                DIM + truncate(` ${t.root.path}:${tLine}  @${t.root.user.login}${replyBadge}`, cw) + RESET
               );
-
-              // ── Location + author ──
-              content.push(
-                DIM +
-                  truncate(` ${t.root.path}:${tLine}  @${t.root.user.login}${replyBadge}`, cw) +
-                  RESET
-              );
-              content.push(DIM + "─".repeat(cw) + RESET);
+              content.push(DIM + ZB.h.repeat(cw) + RESET);
 
               // ── Body (scrollable) ──
               const bodyLines = getBodyLines(width);
@@ -687,16 +765,26 @@ export default function (pi: ExtensionAPI) {
                 content.push("");
               }
 
-              // ── Footer ──
-              content.push(DIM + "─".repeat(cw) + RESET);
-              const hint = " ← → switch · ↑↓ scroll · m mark · x dismiss · Enter fix · Esc exit ";
+              // ── Frame title / footer ──
+              const markedBadge = markedIndices.size > 0 ? ` [${markedIndices.size} marked]` : "";
+              const markFlag  = isMarked ? " ★" : "";
+              const threadPos = `${markFlag} ${threadIdx + 1}/${visibleThreads.length} `;
+              const hint      = ` ← → · ↑↓ · m mark · x dismiss · Enter fix · Esc `;
               const scrollInfo = bodyLines.length > BODY_VISIBLE
                 ? ` ${scrollY + 1}–${Math.min(scrollY + BODY_VISIBLE, bodyLines.length)}/${bodyLines.length} `
                 : "";
-              const fgap = cw - hint.length - scrollInfo.length;
-              content.push(DIM + hint + " ".repeat(Math.max(0, fgap)) + scrollInfo + RESET);
 
-              return box(content, width);
+              return zellijFrame(
+                content, width,
+                {
+                  left:  BOLD + ` PR #${pr.number} Review Comments${markedBadge} ` + RESET,
+                  right: (isMarked ? A_GREEN : DIM) + threadPos + RESET,
+                },
+                {
+                  left:  DIM + hint + RESET,
+                  right: DIM + scrollInfo + RESET,
+                }
+              );
             },
 
             handleInput(data: string) {
@@ -771,38 +859,22 @@ export default function (pi: ExtensionAPI) {
       const selectedThreads = pickedIndices.map((i) => visibleThreads[i]).filter(Boolean);
       if (selectedThreads.length === 0) continue commentLoop;
 
-      // ── 8. Iterative fix loop ────────────────────────────────────────────────
-      //   Pi proposes changes → diff shown for review → user accepts or rejects.
-      //   On rejection the user types feedback; Pi retries with that context.
-      //   On acceptance the diff is committed. Esc at any point exits cleanly.
-      //
-      //   Synchronisation: a 2 s delay before waitForIdle() lets Pi transition
-      //   to "busy" before we check; a 30 s safety poll after covers cases where
-      //   waitForIdle() resolves marginally before Pi's last file write lands.
-
-      const PATCH_VISIBLE = 30;
+      // ── 8. Fix loop: generate → review diff → commit or retry ────────────────
+      const DIFF_VISIBLE = 30;
       let feedback: string | undefined;
 
       fixLoop: while (true) {
-        // Snapshot HEAD so we can diff correctly even if Pi commits
         let baseSha = "";
         try { baseSha = shell("git rev-parse HEAD").trim(); } catch {}
 
-        // ── 8a. Ask Pi to make changes ────────────────────────────────────────
-        await ctx.waitForIdle();
         ctx.ui.setStatus("pr", feedback ? "Pi is revising the fix…" : "Pi is generating a fix…");
-
-        // Promisified agent_end: bridge the event emitter into async/await so
-        // we block here until Pi's turn completes with no polling or fixed delays.
         await new Promise<void>((resolve) => {
           let settled = false;
           pi.on("agent_end", () => { if (!settled) { settled = true; resolve(); } });
           pi.sendUserMessage(buildAgentMessage(selectedThreads, pr.number, feedback));
         });
-
         ctx.ui.setStatus("pr", "");
 
-        // ── 8b. Capture proposed diff ─────────────────────────────────────────
         let currentSha = "";
         let rawDiff = "";
         try {
@@ -811,76 +883,58 @@ export default function (pi: ExtensionAPI) {
             ? `git diff ${baseSha}..${currentSha} --unified=5`
             : "git diff HEAD --unified=5";
           rawDiff = shell(cmd);
-        } catch { /* ignore */ }
-
-        const piCommitted = !!baseSha && !!currentSha && currentSha !== baseSha;
+        } catch {}
 
         if (!rawDiff.trim()) {
           ctx.ui.notify("Pi made no changes.", "info");
           break fixLoop;
         }
-        const patchLines = rawDiff.split("\n");
 
-        // ── 8c. Screen 3 — Diff Review ───────────────────────────────────────
-        //   y / Enter : commit (or keep if Pi already committed)
-        //   n         : reject → prompt for feedback → retry
-        //   Esc       : cancel → revert and exit
+        const patchLines  = rawDiff.split("\n");
+        const piCommitted = !!baseSha && !!currentSha && currentSha !== baseSha;
 
+        // ── Screen 3 — Diff Review ─────────────────────────────────────────
         const decision = await ctx.ui.custom<"commit" | "reject" | "cancel">(
           (tui, _theme, _kb, done) => {
             let scrollY = 0;
-
             function clampScroll() {
-              const max = Math.max(0, patchLines.length - PATCH_VISIBLE);
+              const max = Math.max(0, patchLines.length - DIFF_VISIBLE);
               if (scrollY < 0) scrollY = 0;
               if (scrollY > max) scrollY = max;
             }
-
             return {
               render(width: number): string[] {
-                const cw = width - 2;
-                const innerW = cw - 1;
                 const content: string[] = [];
-
-                const pos = patchLines.length > PATCH_VISIBLE
-                  ? ` [${scrollY + 1}–${Math.min(scrollY + PATCH_VISIBLE, patchLines.length)}/${patchLines.length}]`
-                  : "";
-                const titleLeft = ` Proposed Fix — PR #${pr.number}`;
-                const titleGap  = cw - titleLeft.length - pos.length;
-                content.push(BOLD + titleLeft + " ".repeat(Math.max(0, titleGap)) + pos + RESET);
-                content.push(DIM + "─".repeat(cw) + RESET);
-
-                const end = Math.min(scrollY + PATCH_VISIBLE, patchLines.length);
+                const end = Math.min(scrollY + DIFF_VISIBLE, patchLines.length);
                 for (let i = scrollY; i < end; i++) {
-                  content.push(" " + colorDiffLine(patchLines[i], innerW));
+                  content.push(" " + colorDiffLine(patchLines[i], width - 4));
                 }
-                for (let i = end - scrollY; i < PATCH_VISIBLE; i++) {
-                  content.push("");
-                }
+                for (let i = end - scrollY; i < DIFF_VISIBLE; i++) content.push("");
 
-                content.push(DIM + "─".repeat(cw) + RESET);
-                const hint = " y commit · n reject & retry · Esc cancel ";
-                const scrollInfo = patchLines.length > PATCH_VISIBLE ? " ↑↓ scroll " : "";
-                const fgap = cw - hint.length - scrollInfo.length;
-                content.push(DIM + hint + " ".repeat(Math.max(0, fgap)) + scrollInfo + RESET);
+                const pos        = patchLines.length > DIFF_VISIBLE
+                  ? ` ${scrollY + 1}–${Math.min(scrollY + DIFF_VISIBLE, patchLines.length)}/${patchLines.length} `
+                  : "";
+                const scrollInfo = patchLines.length > DIFF_VISIBLE ? ` ↑↓ ` : "";
 
-                return box(content, width);
+                return zellijFrame(
+                  content, width,
+                  { left: A_BOLD + ` Proposed Fix — PR #${pr.number} ` + A_RESET, right: A_DIM + pos + A_RESET },
+                  { left: A_DIM + ` y commit · n reject & retry · Esc cancel ` + A_RESET, right: A_DIM + scrollInfo + A_RESET }
+                );
               },
-
               handleInput(data: string) {
                 if      (data === "\x1b[A" || data === "k") { scrollY--; clampScroll(); }
                 else if (data === "\x1b[B" || data === "j") { scrollY++; clampScroll(); }
-                else if (data === "\x1b[5~") { scrollY -= PATCH_VISIBLE; clampScroll(); }
-                else if (data === "\x1b[6~") { scrollY += PATCH_VISIBLE; clampScroll(); }
+                else if (data === "\x1b[5~") { scrollY -= DIFF_VISIBLE; clampScroll(); }
+                else if (data === "\x1b[6~") { scrollY += DIFF_VISIBLE; clampScroll(); }
                 else if (data === "\x1b[H")  { scrollY = 0; }
-                else if (data === "\x1b[F")  { scrollY = Math.max(0, patchLines.length - PATCH_VISIBLE); }
-                else if (data === "y")         { done("commit"); return; }
-                else if (data === "n")         { done("reject"); return; }
-                else if (data === "\r" || data === "\n") { /* ignore Enter to prevent leaking from previous screen */ }
-                else if (data === "\x1b")      { done("cancel"); return; }
+                else if (data === "\x1b[F")  { scrollY = Math.max(0, patchLines.length - DIFF_VISIBLE); }
+                else if (data === "y")                      { done("commit"); return; }
+                else if (data === "n")                      { done("reject"); return; }
+                else if (data === "\r" || data === "\n")    { /* block Enter leak */ }
+                else if (data === "\x1b")                   { done("cancel"); return; }
                 tui.requestRender();
               },
-
               invalidate() {},
             };
           },
@@ -900,7 +954,7 @@ export default function (pi: ExtensionAPI) {
           break fixLoop;
         }
 
-        // Revert Pi's changes before retrying or exiting
+        // Revert before retrying or cancelling
         try {
           if (piCommitted) {
             shell(`git reset --hard ${JSON.stringify(baseSha)}`);
@@ -908,7 +962,7 @@ export default function (pi: ExtensionAPI) {
             shell("git restore --staged --worktree .");
           }
         } catch {
-          try { shell("git checkout -- ."); } catch { /* best-effort */ }
+          try { shell("git checkout -- ."); } catch {}
         }
 
         if (decision === "cancel") {
@@ -916,19 +970,339 @@ export default function (pi: ExtensionAPI) {
           break fixLoop;
         }
 
-        // Rejected: collect feedback and loop
+        // Rejected — collect feedback and retry
         const fb = await ctx.ui.input(
           "What was wrong with that fix?",
           "Describe the issue so Pi can try again…"
         );
-        if (!fb) {
-          ctx.ui.notify("No feedback provided — exiting.", "info");
+        if (!fb?.trim()) {
+          ctx.ui.notify("No feedback — exiting.", "info");
           break fixLoop;
         }
-        feedback = fb;
+        feedback = fb.trim();
       }
 
       } // end commentLoop
+    },
+  });
+
+  // ─── /todo command ──────────────────────────────────────────────────────────
+
+  pi.registerCommand("todo", {
+    description:
+      "Browse TODO items from a TODO file in the current repo and have Pi implement them.\n" +
+      "  /todo",
+
+    handler: async (_args, ctx) => {
+      const RESET  = A_RESET;
+      const BOLD   = A_BOLD;
+      const DIM    = A_DIM;
+      const INVERT = A_INVERT;
+
+      // ── 1. Find repo root ─────────────────────────────────────────────────
+      let repoRoot: string;
+      try {
+        repoRoot = shell("git rev-parse --show-toplevel");
+      } catch {
+        ctx.ui.notify("Not in a git repository.", "error");
+        return;
+      }
+
+      // ── 2. Find TODO file ─────────────────────────────────────────────────
+      const relPath = "TODO";
+      const todoPath = join(repoRoot, relPath);
+
+      if (!existsSync(todoPath)) {
+        ctx.ui.notify("No TODO file found at repo root.", "info");
+        return;
+      }
+
+      // ── 3. Parse TODO items ───────────────────────────────────────────────
+      const fileContent = readFileSync(todoPath, "utf8");
+      const threads = parseTodoFile(fileContent, relPath);
+
+      if (threads.length === 0) {
+        ctx.ui.notify(`No open TODO items found in ${relPath}.`, "info");
+        return;
+      }
+
+      // ── 4. Navigator loop ─────────────────────────────────────────────────
+      const BODY_VISIBLE = 22;
+      const dismissedIds = new Set<number>();
+
+      todoLoop: while (true) {
+
+        let visibleThreads: Thread[] = [];
+
+        const pickedIndices = await ctx.ui.custom<number[] | null>(
+          (tui, _theme, _kb, done) => {
+            visibleThreads = threads.filter((t) => !dismissedIds.has(t.root.id));
+
+            if (visibleThreads.length === 0) {
+              done(null);
+              return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+            }
+
+            let threadIdx = 0;
+            let scrollY   = 0;
+            const markedIndices = new Set<number>();
+
+            let cachedWidth = -1;
+            let cachedLines: string[] = [];
+
+            function getBodyLines(width: number): string[] {
+              if (width !== cachedWidth) {
+                cachedWidth = width;
+                cachedLines = threadBodyLines(visibleThreads[threadIdx], width - 2);
+              }
+              return cachedLines;
+            }
+
+            function goToThread(idx: number) {
+              threadIdx = Math.max(0, Math.min(visibleThreads.length - 1, idx));
+              scrollY   = 0;
+              cachedWidth = -1;
+            }
+
+            function clampScroll(bodyLen: number) {
+              const maxScroll = Math.max(0, bodyLen - BODY_VISIBLE);
+              if (scrollY < 0) scrollY = 0;
+              if (scrollY > maxScroll) scrollY = maxScroll;
+            }
+
+            return {
+              render(width: number): string[] {
+                const cw = width - 2;
+                const content: string[] = [];
+                const t = visibleThreads[threadIdx];
+                const tLine = t.root.line ?? "?";
+                const isMarked = markedIndices.has(threadIdx);
+
+                content.push(
+                  DIM + truncate(` ${t.root.path}:${tLine}  [${t.root.user.login}]`, cw) + RESET
+                );
+                content.push(DIM + ZB.h.repeat(cw) + RESET);
+
+                const bodyLines = getBodyLines(width);
+                clampScroll(bodyLines.length);
+
+                const visibleEnd = Math.min(scrollY + BODY_VISIBLE, bodyLines.length);
+                for (let i = scrollY; i < visibleEnd; i++) {
+                  content.push(" " + bodyLines[i]);
+                }
+                for (let i = visibleEnd - scrollY; i < BODY_VISIBLE; i++) {
+                  content.push("");
+                }
+
+                const markedBadge = markedIndices.size > 0 ? ` [${markedIndices.size} marked]` : "";
+                const markFlag    = isMarked ? " ★" : "";
+                const threadPos   = `${markFlag} ${threadIdx + 1}/${visibleThreads.length} `;
+                const hint        = ` ← → · ↑↓ · m mark · x dismiss · Enter fix · Esc `;
+                const scrollInfo  = bodyLines.length > BODY_VISIBLE
+                  ? ` ${scrollY + 1}–${Math.min(scrollY + BODY_VISIBLE, bodyLines.length)}/${bodyLines.length} `
+                  : "";
+
+                return zellijFrame(
+                  content, width,
+                  {
+                    left:  BOLD + ` TODO: ${relPath}${markedBadge} ` + RESET,
+                    right: (isMarked ? A_GREEN : DIM) + threadPos + RESET,
+                  },
+                  {
+                    left:  DIM + hint + RESET,
+                    right: DIM + scrollInfo + RESET,
+                  }
+                );
+              },
+
+              handleInput(data: string) {
+                const bodyLines = getBodyLines(cachedWidth > 0 ? cachedWidth : 80);
+
+                if (data === "\x1b[D" || data === "h") {
+                  goToThread(threadIdx - 1);
+                } else if (data === "\x1b[C" || data === "l") {
+                  goToThread(threadIdx + 1);
+                } else if (data === "\x1b[A" || data === "k") {
+                  scrollY--; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[B" || data === "j") {
+                  scrollY++; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[5~") {
+                  scrollY -= BODY_VISIBLE; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[6~") {
+                  scrollY += BODY_VISIBLE; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[H") {
+                  scrollY = 0;
+                } else if (data === "\x1b[F") {
+                  scrollY = Math.max(0, bodyLines.length - BODY_VISIBLE);
+                } else if (data === "m") {
+                  if (markedIndices.has(threadIdx)) markedIndices.delete(threadIdx);
+                  else markedIndices.add(threadIdx);
+                } else if (data === "x") {
+                  dismissedIds.add(visibleThreads[threadIdx].root.id);
+                  const newMarked = new Set<number>();
+                  for (const idx of markedIndices) {
+                    if (idx < threadIdx) newMarked.add(idx);
+                    else if (idx > threadIdx) newMarked.add(idx - 1);
+                  }
+                  markedIndices.clear();
+                  for (const idx of newMarked) markedIndices.add(idx);
+                  visibleThreads = threads.filter((t) => !dismissedIds.has(t.root.id));
+                  if (visibleThreads.length === 0) { done(null); return; }
+                  threadIdx = Math.min(threadIdx, visibleThreads.length - 1);
+                  cachedWidth = -1;
+                } else if (data === "\r" || data === "\n") {
+                  const toFix = markedIndices.size > 0
+                    ? Array.from(markedIndices).sort((a, b) => a - b)
+                    : [threadIdx];
+                  done(toFix);
+                  return;
+                } else if (data === "\x1b") {
+                  done(null);
+                  return;
+                }
+
+                tui.requestRender();
+              },
+
+              invalidate() { cachedWidth = -1; },
+            };
+          },
+          { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
+        );
+
+        if (pickedIndices === null) {
+          if (visibleThreads.length === 0) {
+            ctx.ui.notify("All TODO items dismissed.", "info");
+          }
+          break todoLoop;
+        }
+
+        const selectedThreads = pickedIndices.map((i) => visibleThreads[i]).filter(Boolean);
+        if (selectedThreads.length === 0) continue todoLoop;
+
+        // ── 5. Fix loop ─────────────────────────────────────────────────────
+        const DIFF_VISIBLE = 30;
+        let feedback: string | undefined;
+
+        fixLoop: while (true) {
+          let baseSha = "";
+          try { baseSha = shell("git rev-parse HEAD").trim(); } catch {}
+
+          ctx.ui.setStatus("todo", feedback ? "Pi is revising the implementation…" : "Pi is implementing TODO…");
+          await new Promise<void>((resolve) => {
+            let settled = false;
+            pi.on("agent_end", () => { if (!settled) { settled = true; resolve(); } });
+            pi.sendUserMessage(buildTodoAgentMessage(selectedThreads, feedback));
+          });
+          ctx.ui.setStatus("todo", "");
+
+          let currentSha = "";
+          let rawDiff = "";
+          try {
+            currentSha = shell("git rev-parse HEAD").trim();
+            const cmd = currentSha !== baseSha
+              ? `git diff ${baseSha}..${currentSha} --unified=5`
+              : "git diff HEAD --unified=5";
+            rawDiff = shell(cmd);
+          } catch {}
+
+          if (!rawDiff.trim()) {
+            ctx.ui.notify("Pi made no changes.", "info");
+            break fixLoop;
+          }
+
+          const patchLines  = rawDiff.split("\n");
+          const piCommitted = !!baseSha && !!currentSha && currentSha !== baseSha;
+
+          const decision = await ctx.ui.custom<"commit" | "reject" | "cancel">(
+            (tui, _theme, _kb, done) => {
+              let scrollY = 0;
+              function clampScroll() {
+                const max = Math.max(0, patchLines.length - DIFF_VISIBLE);
+                if (scrollY < 0) scrollY = 0;
+                if (scrollY > max) scrollY = max;
+              }
+              return {
+                render(width: number): string[] {
+                  const content: string[] = [];
+                  const end = Math.min(scrollY + DIFF_VISIBLE, patchLines.length);
+                  for (let i = scrollY; i < end; i++) {
+                    content.push(" " + colorDiffLine(patchLines[i], width - 4));
+                  }
+                  for (let i = end - scrollY; i < DIFF_VISIBLE; i++) content.push("");
+
+                  const pos = patchLines.length > DIFF_VISIBLE
+                    ? ` ${scrollY + 1}–${Math.min(scrollY + DIFF_VISIBLE, patchLines.length)}/${patchLines.length} `
+                    : "";
+                  const scrollInfo = patchLines.length > DIFF_VISIBLE ? ` ↑↓ ` : "";
+
+                  return zellijFrame(
+                    content, width,
+                    { left: A_BOLD + ` Proposed Implementation — ${relPath} ` + A_RESET, right: A_DIM + pos + A_RESET },
+                    { left: A_DIM + ` y commit · n reject & retry · Esc cancel ` + A_RESET, right: A_DIM + scrollInfo + A_RESET }
+                  );
+                },
+                handleInput(data: string) {
+                  if      (data === "\x1b[A" || data === "k") { scrollY--; clampScroll(); }
+                  else if (data === "\x1b[B" || data === "j") { scrollY++; clampScroll(); }
+                  else if (data === "\x1b[5~") { scrollY -= DIFF_VISIBLE; clampScroll(); }
+                  else if (data === "\x1b[6~") { scrollY += DIFF_VISIBLE; clampScroll(); }
+                  else if (data === "\x1b[H")  { scrollY = 0; }
+                  else if (data === "\x1b[F")  { scrollY = Math.max(0, patchLines.length - DIFF_VISIBLE); }
+                  else if (data === "y")                   { done("commit"); return; }
+                  else if (data === "n")                   { done("reject"); return; }
+                  else if (data === "\r" || data === "\n") { /* block Enter leak */ }
+                  else if (data === "\x1b")                { done("cancel"); return; }
+                  tui.requestRender();
+                },
+                invalidate() {},
+              };
+            },
+            { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
+          );
+
+          if (decision === "commit") {
+            try {
+              if (!piCommitted) {
+                shell("git add -A");
+                shell(`git commit -m ${JSON.stringify(buildTodoCommitMessage(selectedThreads))}`);
+              }
+              // Auto-dismiss the completed items so they vanish from future loops
+              for (const t of selectedThreads) dismissedIds.add(t.root.id);
+              ctx.ui.notify(`Implementation committed.`, "info");
+            } catch (err: any) {
+              ctx.ui.notify(`Commit failed: ${err.message}`, "error");
+            }
+            break fixLoop;
+          }
+
+          try {
+            if (piCommitted) {
+              shell(`git reset --hard ${JSON.stringify(baseSha)}`);
+            } else {
+              shell("git restore --staged --worktree .");
+            }
+          } catch {
+            try { shell("git checkout -- ."); } catch {}
+          }
+
+          if (decision === "cancel") {
+            ctx.ui.notify("Cancelled — changes reverted.", "info");
+            break fixLoop;
+          }
+
+          const fb = await ctx.ui.input(
+            "What was wrong with that implementation?",
+            "Describe the issue so Pi can try again…"
+          );
+          if (!fb?.trim()) {
+            ctx.ui.notify("No feedback — exiting.", "info");
+            break fixLoop;
+          }
+          feedback = fb.trim();
+        }
+
+      } // end todoLoop
     },
   });
 }
