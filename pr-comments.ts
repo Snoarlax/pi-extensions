@@ -17,7 +17,7 @@
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { execSync } from "node:child_process";
-import { existsSync, readFileSync } from "node:fs";
+import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 // ─── ANSI constants (module-level so helpers can use them) ────────────────────
@@ -28,6 +28,7 @@ const A_DIM    = "\x1b[2m";
 const A_INVERT = "\x1b[7m";
 const A_RED    = "\x1b[31m";
 const A_GREEN  = "\x1b[32m";
+const A_YELLOW = "\x1b[33m";
 const A_CYAN   = "\x1b[36m";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -555,6 +556,105 @@ function buildTodoCommitMessage(selectedThreads: Thread[]): string {
     return `Complete TODO: ${summary}`;
   }
   return `Complete ${selectedThreads.length} TODO items`;
+}
+
+// ─── Slack digest support ─────────────────────────────────────────────────────
+
+interface DigestEntry {
+  id: number;
+  thread_key: string;
+  text: string;
+  digest_ts: string;
+}
+
+let _digestIdCounter = 0;
+
+async function fetchDigestEntries(port: number, n: number): Promise<DigestEntry[]> {
+  const res = await fetch(`http://localhost:${port}/threads?from=0&n=${n}`);
+  if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+  const raw = (await res.json()) as Omit<DigestEntry, "id">[];
+  return raw.map((e) => ({ ...e, id: _digestIdCounter++ }));
+}
+
+function digestBodyLines(entry: DigestEntry, width: number): string[] {
+  const lines: string[] = [
+    A_DIM + `thread: ${entry.thread_key}` + A_RESET,
+    "",
+    ...wordWrap(entry.text, width),
+  ];
+  return lines;
+}
+
+function buildSlackAgentMessage(
+  entries: DigestEntry[],
+  feedback?: string,
+  plan?: string
+): string {
+  const parts: string[] = [];
+
+  if (entries.length === 1) {
+    const e = entries[0];
+    parts.push(
+      `Handle this Slack thread from your digest:`,
+      ``,
+      `Thread: ${e.thread_key}`,
+      ``,
+      `---`,
+      e.text,
+      `---`,
+      ``,
+      `Please review this and take appropriate action. If code changes are needed, implement them. If a reply is needed, draft one.`,
+    );
+  } else {
+    parts.push(`Handle these ${entries.length} Slack threads from your digest:`, ``);
+    for (let i = 0; i < entries.length; i++) {
+      const e = entries[i];
+      parts.push(
+        `─── Thread ${i + 1} of ${entries.length} ───`,
+        `Thread: ${e.thread_key}`,
+        ``,
+        e.text,
+        ``,
+      );
+    }
+    parts.push(
+      `Please handle all of the above. Implement any required code changes and note any replies that should be sent.`
+    );
+  }
+
+  if (plan) {
+    parts.push(``, `Approved implementation plan:`, ``, plan);
+  }
+
+  if (feedback) {
+    parts.push(
+      ``,
+      `Previous attempt was rejected. Feedback:`,
+      ``,
+      `  ${feedback}`,
+      ``,
+      `Please revise your approach accordingly.`
+    );
+  }
+
+  return parts.join("\n").trim();
+}
+
+function buildSlackPlanRequestMessage(entries: DigestEntry[]): string {
+  const base = buildSlackAgentMessage(entries);
+  return (
+    `Before making any changes, produce a concise numbered implementation plan for the task below.\n` +
+    `Output ONLY the numbered list — no prose, no code. Do not modify any files.\n\n` +
+    base
+  );
+}
+
+function buildSlackCommitMessage(entries: DigestEntry[]): string {
+  if (entries.length === 1) {
+    const summary = entries[0].text.split("\n")[0].replace(/`/g, "'").slice(0, 72);
+    return `Handle Slack thread: ${summary}`;
+  }
+  return `Handle ${entries.length} Slack digest threads`;
 }
 
 // ─── Planning stage ───────────────────────────────────────────────────────────
@@ -1551,6 +1651,382 @@ export default function (pi: ExtensionAPI) {
         }
 
       } // end todoLoop
+    },
+  });
+
+  // ─── /slack command ──────────────────────────────────────────────────────────
+
+  pi.registerCommand("slack", {
+    description:
+      "Browse Slack digest threads and have Pi act on them.\n" +
+      "  /slack           — fetch last 20 entries\n" +
+      "  /slack 50        — fetch last 50 entries\n" +
+      "\n" +
+      "Requires: slack-digest bot running at http://localhost:7001\n" +
+      "  cd ~/.pi/slack-digest && python bot.py",
+
+    handler: async (args, ctx) => {
+      const port = parseInt(process.env.SLACK_DIGEST_PORT ?? "7001", 10);
+      const n    = parseInt(args.trim(), 10) || 20;
+
+      // ── 1. Fetch entries ────────────────────────────────────────────────────
+      ctx.ui.setStatus("slack", "Fetching Slack digest…");
+      let entries: DigestEntry[];
+      try {
+        entries = await fetchDigestEntries(port, n);
+      } catch (err: any) {
+        ctx.ui.setStatus("slack", "");
+        ctx.ui.notify(
+          `slack-digest bot unreachable at http://localhost:${port} — is it running?\n${err.message}`,
+          "error"
+        );
+        return;
+      }
+      ctx.ui.setStatus("slack", "");
+
+      if (entries.length === 0) {
+        ctx.ui.notify("Slack digest is empty — no threads yet.", "info");
+        return;
+      }
+
+      // ── 2. Navigator loop ───────────────────────────────────────────────────
+      const BODY_VISIBLE = 22;
+      const dismissedIds = new Set<number>();
+
+      slackLoop: while (true) {
+        let visibleEntries: DigestEntry[] = [];
+
+        const pickedIndices = await ctx.ui.custom<number[] | null>(
+          (tui, _theme, _kb, done) => {
+            visibleEntries = entries.filter((e) => !dismissedIds.has(e.id));
+
+            if (visibleEntries.length === 0) {
+              done(null);
+              return { render: () => [], handleInput: () => {}, invalidate: () => {} };
+            }
+
+            let entryIdx  = 0;
+            let scrollY   = 0;
+            const markedIndices = new Set<number>();
+
+            let cachedWidth = -1;
+            let cachedLines: string[] = [];
+
+            function getBodyLines(width: number): string[] {
+              if (width !== cachedWidth) {
+                cachedWidth = width;
+                cachedLines = digestBodyLines(visibleEntries[entryIdx], width - 2);
+              }
+              return cachedLines;
+            }
+
+            function goToEntry(idx: number) {
+              entryIdx    = Math.max(0, Math.min(visibleEntries.length - 1, idx));
+              scrollY     = 0;
+              cachedWidth = -1;
+            }
+
+            function clampScroll(bodyLen: number) {
+              const maxScroll = Math.max(0, bodyLen - BODY_VISIBLE);
+              if (scrollY < 0) scrollY = 0;
+              if (scrollY > maxScroll) scrollY = maxScroll;
+            }
+
+            return {
+              render(width: number): string[] {
+                const cw = width - 2;
+                const content: string[] = [];
+                const e        = visibleEntries[entryIdx];
+                const isMarked = markedIndices.has(entryIdx);
+
+                content.push(
+                  A_DIM + truncate(` ${e.thread_key}`, cw) + A_RESET
+                );
+                content.push(A_DIM + ZB.h.repeat(cw) + A_RESET);
+
+                const bodyLines = getBodyLines(width);
+                clampScroll(bodyLines.length);
+
+                const visibleEnd = Math.min(scrollY + BODY_VISIBLE, bodyLines.length);
+                for (let i = scrollY; i < visibleEnd; i++) {
+                  content.push(" " + bodyLines[i]);
+                }
+                for (let i = visibleEnd - scrollY; i < BODY_VISIBLE; i++) {
+                  content.push("");
+                }
+
+                const markedBadge = markedIndices.size > 0 ? ` [${markedIndices.size} marked]` : "";
+                const markFlag    = isMarked ? " ★" : "";
+                const entryPos    = `${markFlag} ${entryIdx + 1}/${visibleEntries.length} `;
+                const hint        = ` ← → · ↑↓ · m mark · x dismiss · Enter act · Esc `;
+                const scrollInfo  = bodyLines.length > BODY_VISIBLE
+                  ? ` ${scrollY + 1}–${Math.min(scrollY + BODY_VISIBLE, bodyLines.length)}/${bodyLines.length} `
+                  : "";
+
+                return zellijFrame(
+                  content, width,
+                  {
+                    left:  A_BOLD + ` Slack Digest${markedBadge} ` + A_RESET,
+                    right: (isMarked ? A_GREEN : A_DIM) + entryPos + A_RESET,
+                  },
+                  {
+                    left:  A_DIM + hint + A_RESET,
+                    right: A_DIM + scrollInfo + A_RESET,
+                  }
+                );
+              },
+
+              handleInput(data: string) {
+                const bodyLines = getBodyLines(cachedWidth > 0 ? cachedWidth : 80);
+
+                if (data === "\x1b[D" || data === "h") {
+                  goToEntry(entryIdx - 1);
+                } else if (data === "\x1b[C" || data === "l") {
+                  goToEntry(entryIdx + 1);
+                } else if (data === "\x1b[A" || data === "k") {
+                  scrollY--; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[B" || data === "j") {
+                  scrollY++; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[5~") {
+                  scrollY -= BODY_VISIBLE; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[6~") {
+                  scrollY += BODY_VISIBLE; clampScroll(bodyLines.length);
+                } else if (data === "\x1b[H") {
+                  scrollY = 0;
+                } else if (data === "\x1b[F") {
+                  scrollY = Math.max(0, bodyLines.length - BODY_VISIBLE);
+                } else if (data === "m") {
+                  if (markedIndices.has(entryIdx)) markedIndices.delete(entryIdx);
+                  else markedIndices.add(entryIdx);
+                } else if (data === "x") {
+                  dismissedIds.add(visibleEntries[entryIdx].id);
+                  const newMarked = new Set<number>();
+                  for (const idx of markedIndices) {
+                    if (idx < entryIdx) newMarked.add(idx);
+                    else if (idx > entryIdx) newMarked.add(idx - 1);
+                  }
+                  markedIndices.clear();
+                  for (const idx of newMarked) markedIndices.add(idx);
+                  visibleEntries = entries.filter((e) => !dismissedIds.has(e.id));
+                  if (visibleEntries.length === 0) { done(null); return; }
+                  entryIdx = Math.min(entryIdx, visibleEntries.length - 1);
+                  cachedWidth = -1;
+                } else if (data === "\r" || data === "\n") {
+                  const toAct = markedIndices.size > 0
+                    ? Array.from(markedIndices).sort((a, b) => a - b)
+                    : [entryIdx];
+                  done(toAct);
+                  return;
+                } else if (data === "\x1b") {
+                  done(null);
+                  return;
+                }
+
+                tui.requestRender();
+              },
+
+              invalidate() { cachedWidth = -1; },
+            };
+          },
+          { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
+        );
+
+        if (pickedIndices === null) {
+          if (visibleEntries.length === 0) {
+            ctx.ui.notify("All Slack digest entries dismissed.", "info");
+          }
+          break slackLoop;
+        }
+
+        const selectedEntries = pickedIndices.map((i) => visibleEntries[i]).filter(Boolean);
+        if (selectedEntries.length === 0) continue slackLoop;
+
+        // ── 3. Edit stage — let user review/trim/annotate before planning ───────
+        let finalEntries = [...selectedEntries];
+
+        const wantEdit = await ctx.ui.confirm(
+          "Edit thread content before planning?",
+          selectedEntries.length === 1
+            ? selectedEntries[0].text.split("\n")[0].trim().slice(0, 80)
+            : `${selectedEntries.length} threads selected`
+        );
+
+        if (wantEdit) {
+          const editor = process.env.VISUAL ?? process.env.EDITOR ?? "vi";
+          for (let i = 0; i < finalEntries.length; i++) {
+            const e = finalEntries[i];
+            const tmpFile = `/tmp/pi-slack-edit-${Date.now()}-${i}.txt`;
+            writeFileSync(
+              tmpFile,
+              `# Thread: ${e.thread_key}\n` +
+              `# Edit the content below. Lines starting with # are stripped.\n` +
+              `# Save and quit when done.\n\n` +
+              e.text
+            );
+            try {
+              execSync(`${editor} ${JSON.stringify(tmpFile)}`, { stdio: "inherit" });
+            } catch { /* non-zero exit is fine */ }
+            const edited = readFileSync(tmpFile, "utf8")
+              .split("\n")
+              .filter((l) => !l.startsWith("#"))
+              .join("\n")
+              .trim();
+            try { shell(`rm -f ${JSON.stringify(tmpFile)}`); } catch {}
+            if (edited) finalEntries[i] = { ...e, text: edited };
+          }
+        }
+
+        // ── 4. Plan stage ──────────────────────────────────────────────────────
+        const { approved: planApproved, planText: approvedPlan } = await planStage(
+          pi, ctx,
+          buildSlackPlanRequestMessage(finalEntries),
+          "slack"
+        );
+        if (!planApproved) continue slackLoop;
+
+        // ── 5. Fix loop ────────────────────────────────────────────────────────
+        const DIFF_VISIBLE = 30;
+        let feedback: string | undefined;
+        let continuing = false;
+
+        let sessionBaseSha = "";
+        try { sessionBaseSha = shell("git rev-parse HEAD").trim(); } catch {}
+
+        fixLoop: while (true) {
+          let turnBaseSha = "";
+          try { turnBaseSha = shell("git rev-parse HEAD").trim(); } catch {}
+
+          const statusMsg = continuing ? "Pi is continuing…"
+            : feedback     ? "Pi is revising…"
+            :                "Pi is handling the thread…";
+          ctx.ui.setStatus("slack", statusMsg);
+
+          const msg = continuing
+            ? "Please continue. Keep going until the task is fully complete."
+            : buildSlackAgentMessage(finalEntries, feedback, approvedPlan);
+          await new Promise<void>((resolve) => {
+            let settled = false;
+            pi.on("agent_end", () => { if (!settled) { settled = true; resolve(); } });
+            pi.sendUserMessage(msg);
+          });
+          ctx.ui.setStatus("slack", "");
+          continuing = false;
+
+          let currentSha = "";
+          let rawDiff = "";
+          try {
+            currentSha = shell("git rev-parse HEAD").trim();
+            const base = sessionBaseSha || turnBaseSha;
+            const cmd  = currentSha !== base
+              ? `git diff ${base}..${currentSha} --unified=5`
+              : "git diff HEAD --unified=5";
+            rawDiff = shell(cmd);
+          } catch {}
+
+          if (!rawDiff.trim()) {
+            ctx.ui.notify("Pi made no changes.", "info");
+            break fixLoop;
+          }
+
+          const patchLines  = rawDiff.split("\n");
+          const piCommitted = !!turnBaseSha && !!currentSha && currentSha !== turnBaseSha;
+
+          const decision = await ctx.ui.custom<"commit" | "continue" | "reject" | "cancel">(
+            (tui, _theme, _kb, done) => {
+              let scrollY = 0;
+              function clampScroll() {
+                const max = Math.max(0, patchLines.length - DIFF_VISIBLE);
+                if (scrollY < 0) scrollY = 0;
+                if (scrollY > max) scrollY = max;
+              }
+              return {
+                render(width: number): string[] {
+                  const content: string[] = [];
+                  const end = Math.min(scrollY + DIFF_VISIBLE, patchLines.length);
+                  for (let i = scrollY; i < end; i++) {
+                    content.push(" " + colorDiffLine(patchLines[i], width - 4));
+                  }
+                  for (let i = end - scrollY; i < DIFF_VISIBLE; i++) content.push("");
+
+                  const pos = patchLines.length > DIFF_VISIBLE
+                    ? ` ${scrollY + 1}–${Math.min(scrollY + DIFF_VISIBLE, patchLines.length)}/${patchLines.length} `
+                    : "";
+                  const scrollInfo = patchLines.length > DIFF_VISIBLE ? ` ↑↓ ` : "";
+
+                  return zellijFrame(
+                    content, width,
+                    { left: A_BOLD + ` Proposed Implementation — Slack ` + A_RESET, right: A_DIM + pos + A_RESET },
+                    { left: A_DIM + ` y commit · c continue · n reject · Esc cancel ` + A_RESET, right: A_DIM + scrollInfo + A_RESET }
+                  );
+                },
+                handleInput(data: string) {
+                  if      (data === "\x1b[A" || data === "k") { scrollY--; clampScroll(); }
+                  else if (data === "\x1b[B" || data === "j") { scrollY++; clampScroll(); }
+                  else if (data === "\x1b[5~") { scrollY -= DIFF_VISIBLE; clampScroll(); }
+                  else if (data === "\x1b[6~") { scrollY += DIFF_VISIBLE; clampScroll(); }
+                  else if (data === "\x1b[H")  { scrollY = 0; }
+                  else if (data === "\x1b[F")  { scrollY = Math.max(0, patchLines.length - DIFF_VISIBLE); }
+                  else if (data === "y")                   { done("commit");   return; }
+                  else if (data === "c")                   { done("continue"); return; }
+                  else if (data === "n")                   { done("reject");   return; }
+                  else if (data === "\r" || data === "\n") { /* block Enter leak */ }
+                  else if (data === "\x1b")                { done("cancel");   return; }
+                  tui.requestRender();
+                },
+                invalidate() {},
+              };
+            },
+            { overlay: true, overlayOptions: { width: "95%", maxHeight: "95%", anchor: "center" } }
+          );
+
+          if (decision === "commit") {
+            try {
+              if (!piCommitted) {
+                shell("git add -A");
+                shell(`git commit -m ${JSON.stringify(buildSlackCommitMessage(finalEntries))}`);
+              }
+              for (const e of finalEntries) dismissedIds.add(e.id);
+              ctx.ui.notify("Implementation committed.", "info");
+            } catch (err: any) {
+              ctx.ui.notify(`Commit failed: ${err.message}`, "error");
+            }
+            break fixLoop;
+          }
+
+          if (decision === "continue") {
+            continuing = true;
+            feedback = undefined;
+            continue fixLoop;
+          }
+
+          try {
+            if (currentSha !== sessionBaseSha) {
+              shell(`git reset --hard ${JSON.stringify(sessionBaseSha)}`);
+            } else {
+              shell("git restore --staged --worktree .");
+            }
+          } catch {
+            try { shell("git checkout -- ."); } catch {}
+          }
+
+          if (decision === "cancel") {
+            ctx.ui.notify("Cancelled — changes reverted.", "info");
+            break fixLoop;
+          }
+
+          const fb = await ctx.ui.input(
+            "What was wrong with that implementation?",
+            "Describe the issue so Pi can try again…"
+          );
+          if (!fb?.trim()) {
+            ctx.ui.notify("No feedback — exiting.", "info");
+            break fixLoop;
+          }
+          feedback = fb.trim();
+          try { sessionBaseSha = shell("git rev-parse HEAD").trim(); } catch {}
+        }
+
+      } // end slackLoop
     },
   });
 }
