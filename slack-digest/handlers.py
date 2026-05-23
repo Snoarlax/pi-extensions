@@ -1,11 +1,12 @@
 """Register all Slack action and event handlers onto the app instance."""
 
 import logging
+import time
 
 from blocks import action_buttons, make_blocks, swap_action_block, truncate, thread_state
 from core import add_dm_message_to_log, _resolve_dm_thread_key, surface_thread
 from slack_helpers import get_channel_id, is_mentioned, resolve_dm_channel, resolve_user_id
-from state import tracked_threads, save_state
+from state import message_log, tracked_threads, save_state
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,37 @@ def register(app) -> None:
         except Exception as exc:
             logger.error("Error in mark_unimportant: %s", exc, exc_info=True)
 
+    @app.command("/new-thread")
+    def handle_new(ack, body, client):
+        ack()
+        try:
+            user_id = resolve_user_id(client)
+            if not user_id or body.get("user_id") != user_id:
+                return
+
+            text = (body.get("text") or "").strip()
+            if not text:
+                return
+
+            dm_channel = resolve_dm_channel(client)
+            if not dm_channel:
+                return
+
+            # Generate key before posting so blocks can reference it immediately
+            thread_key = f"note:{time.time()}"
+            response = client.chat_postMessage(
+                channel=dm_channel,
+                text=text,
+                blocks=make_blocks(text, thread_key, is_reply=False),
+            )
+            digest_ts = response["ts"]
+            tracked_threads[thread_key] = {"status": "normal", "digest_ts": digest_ts, "last_ts": digest_ts}
+            save_state()
+            message_log.insert(0, {"thread_key": thread_key, "text": text, "ts": digest_ts, "type": "new"})
+            logger.info("Created note thread %s", thread_key)
+        except Exception as exc:
+            logger.error("Error in /new: %s", exc, exc_info=True)
+
     @app.action("track_again")
     def handle_track_again(ack, body, client):
         ack()
@@ -56,6 +88,22 @@ def register(app) -> None:
             thread_key = body["actions"][0]["value"]
             msg = body.get("message", {})
             digest_ts = msg["ts"]
+
+            if thread_key.startswith("note:"):
+                # No source channel — restore using the text already in the DM message
+                full_text = msg.get("text", "")
+                entry = tracked_threads.setdefault(thread_key, {"digest_ts": digest_ts, "last_ts": digest_ts})
+                entry["status"] = "normal"
+                save_state()
+                logger.info("Note %s restored to tracking", thread_key)
+                client.chat_update(
+                    channel=get_channel_id(body),
+                    ts=digest_ts,
+                    blocks=make_blocks(full_text, thread_key, is_reply=False),
+                    text=full_text,
+                )
+                return
+
             source_channel, thread_ts = thread_key.rsplit(":", 1)
 
             messages = client.conversations_replies(channel=source_channel, ts=thread_ts).get("messages", [])
@@ -168,7 +216,7 @@ def register(app) -> None:
     @app.event("reaction_added")
     def handle_reaction_added(event, client):
         user_id = resolve_user_id(client)
-        if not user_id:
+        if not user_id or event["user"] != user_id:
             return
         item = event.get("item", {})
         if item.get("type") != "message":
@@ -204,8 +252,12 @@ def register(app) -> None:
                     logger.warning("Could not update DM buttons for %s: %s", thread_key, exc)
             return
 
-        # :robot_face: on a channel message (any user) → surface + add to job board
-        if reaction == "robot_face" and channel != dm_channel:
+        # Ignore all other DM reactions
+        if channel == dm_channel:
+            return
+
+        # :robot_face: on a channel message → surface + add to job board
+        if reaction == "robot_face":
             try:
                 result = client.conversations_replies(channel=channel, ts=msg_ts, limit=1)
                 root = result["messages"][0] if result.get("messages") else None
@@ -216,11 +268,11 @@ def register(app) -> None:
                 return
             thread_ts = root["ts"]
             key = f"{channel}:{thread_ts}"
-            # Set status before surfacing so the new DM post renders on_board buttons
+            # Set status before surfacing so new DM posts render with on_board buttons
             _set_status(key, "on_board")
             surface_thread(client, channel, thread_ts)
             logger.info("Thread %s added to job board via :robot_face: reaction", key)
-            # If the DM post already existed, update its buttons
+            # If a DM post already existed, update its buttons to reflect on_board
             entry = tracked_threads.get(key)
             if entry and entry.get("digest_ts"):
                 try:
@@ -242,10 +294,7 @@ def register(app) -> None:
                     logger.warning("Could not update DM buttons for %s: %s", key, exc)
             return
 
-        # Any other reaction: only care about the watched user, not the DM channel
-        if event["user"] != user_id or channel == dm_channel:
-            return
-
+        # Any other reaction by the watched user → surface the thread
         logger.info("Reaction by watched user in %s at %s", channel, msg_ts)
         try:
             result = client.conversations_replies(channel=channel, ts=msg_ts, limit=1)
